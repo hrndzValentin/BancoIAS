@@ -90,6 +90,29 @@ class ProcessPaymentReportIntegrationTest {
 			.verifyComplete();
 	}
 
+	// Conservation invariant: what was applied plus what is still pending equals the initial balance.
+	private void assertConservation(String orderId, String initialBalance) {
+		StepVerifier.create(databaseClient.sql("""
+				SELECT o.pending_balance
+				     + COALESCE((SELECT SUM(r.amount) FROM payment_report r
+				                  WHERE r.collection_order_id = o.id AND r.status = 'APPLIED'), 0) AS total
+				  FROM collection_order o
+				 WHERE o.id = :id
+				""").bind("id", orderId).map(row -> row.get("total", BigDecimal.class)).one())
+			.assertNext(total -> assertThat(total).isEqualByComparingTo(initialBalance))
+			.verifyComplete();
+	}
+
+	private void assertReportCount(String orderId, long expected) {
+		StepVerifier
+			.create(databaseClient.sql("SELECT COUNT(*) AS total FROM payment_report WHERE collection_order_id = :id")
+				.bind("id", orderId)
+				.map(row -> row.get("total", Long.class))
+				.one())
+			.expectNext(expected)
+			.verifyComplete();
+	}
+
 	@Test
 	void appliesPaymentAndDecreasesBalance() {
 		StepVerifier.create(processNew(command("REF-1", "ORD-PSE-1001", "COM-10", "600000")))
@@ -160,6 +183,77 @@ class ProcessPaymentReportIntegrationTest {
 		}).verifyComplete();
 
 		assertBalance("ORD-PSE-1001", "100000");
+		assertConservation("ORD-PSE-1001", "1000000");
+	}
+
+	@RepeatedTest(5)
+	void concurrentReportsOnBlockedOrderAreAllRejected() {
+		int reports = 5;
+		Flux<PaymentReport> concurrent = Flux.range(1, reports)
+			.flatMap(i -> processNew(command("REF-B-" + i, "ORD-PSE-1002", "COM-10", "100000")), reports);
+
+		StepVerifier.create(concurrent.collectList())
+			.assertNext(results -> assertThat(results).hasSize(reports).allSatisfy(report -> {
+				assertThat(report.status()).isEqualTo(ReportStatus.REJECTED);
+				assertThat(report.rejectionReason()).isEqualTo(RejectionReason.ORDER_NOT_ENABLED);
+			}))
+			.verifyComplete();
+
+		assertReportCount("ORD-PSE-1002", reports);
+		assertBalance("ORD-PSE-1002", "800000");
+		assertConservation("ORD-PSE-1002", "800000");
+	}
+
+	@RepeatedTest(5)
+	void concurrentDistinctAndRepeatedReferencesApplyEachReferenceOnce() {
+		int references = 3;
+		int copies = 3;
+		Flux<ProcessingOutcome> mixed = Flux.range(0, references * copies)
+			.flatMap(i -> useCase.process(command("REF-M-" + (i % references), "ORD-PSE-1001", "COM-10", "300000")),
+					references * copies);
+
+		StepVerifier.create(mixed.collectList()).assertNext(outcomes -> {
+			assertThat(outcomes).filteredOn(Processed.class::isInstance)
+				.hasSize(references)
+				.allSatisfy(outcome -> assertThat(((Processed) outcome).report().status())
+					.isEqualTo(ReportStatus.APPLIED));
+			assertThat(outcomes).filteredOn(Replayed.class::isInstance).hasSize(references * (copies - 1));
+		}).verifyComplete();
+
+		assertReportCount("ORD-PSE-1001", references);
+		for (int i = 0; i < references; i++) {
+			assertStoredReport("REF-M-" + i, ReportStatus.APPLIED, null);
+		}
+		assertBalance("ORD-PSE-1001", "100000");
+		assertConservation("ORD-PSE-1001", "1000000");
+	}
+
+	@RepeatedTest(5)
+	void concurrentReportsOnTwoOrdersDoNotInterfere() {
+		int reportsPerOrder = 10;
+		// Even i → ORD-PSE-1001 (1.000.000, 300.000 each); odd i → ORD-PSE-2001 (2.000.000, 500.000 each).
+		Flux<PaymentReport> concurrent = Flux.range(0, reportsPerOrder * 2)
+			.flatMap(i -> processNew((i % 2 == 0) ? command("REF-A-" + i, "ORD-PSE-1001", "COM-10", "300000")
+					: command("REF-B-" + i, "ORD-PSE-2001", "COM-20", "500000")), reportsPerOrder * 2);
+
+		StepVerifier.create(concurrent.collectList()).assertNext(results -> {
+			assertThat(results).filteredOn(report -> report.collectionOrderId().equals("ORD-PSE-1001"))
+				.filteredOn(report -> report.status() == ReportStatus.APPLIED)
+				.hasSize(3);
+			assertThat(results).filteredOn(report -> report.collectionOrderId().equals("ORD-PSE-2001"))
+				.filteredOn(report -> report.status() == ReportStatus.APPLIED)
+				.hasSize(4);
+			assertThat(results).filteredOn(report -> report.status() == ReportStatus.REJECTED)
+				.hasSize(13)
+				.allSatisfy(report -> assertThat(report.rejectionReason())
+					.isEqualTo(RejectionReason.INSUFFICIENT_BALANCE));
+		}).verifyComplete();
+
+		assertBalance("ORD-PSE-1001", "100000");
+		assertBalance("ORD-PSE-2001", "0");
+		assertConservation("ORD-PSE-1001", "1000000");
+		assertConservation("ORD-PSE-2001", "2000000");
+		assertBalance("ORD-PSE-1002", "800000");
 	}
 
 	@Test
@@ -220,6 +314,7 @@ class ProcessPaymentReportIntegrationTest {
 
 		assertStoredReport("REF-P", ReportStatus.APPLIED, null);
 		assertBalance("ORD-PSE-1001", "700000");
+		assertConservation("ORD-PSE-1001", "1000000");
 	}
 
 }

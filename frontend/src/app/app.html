@@ -1,0 +1,126 @@
+<main>
+  <h1>Recaudos PSE · BancoIAS</h1>
+
+  <section>
+    <h2>Registrar reporte de pago</h2>
+    <form [formGroup]="form" (ngSubmit)="submit()" novalidate>
+      <label for="paymentReference">Referencia de pago</label>
+      <div class="inline">
+        <input id="paymentReference" formControlName="paymentReference" maxlength="50" autocomplete="off" />
+        <button type="button" (click)="generateReference()">Generar</button>
+      </div>
+      @if (showError('paymentReference', 'required')) {
+        <small class="field-error">La referencia es obligatoria.</small>
+      }
+
+      <label for="collectionOrderId">Orden de recaudo</label>
+      <input id="collectionOrderId" formControlName="collectionOrderId" list="seed-orders" maxlength="30" autocomplete="off" />
+      <datalist id="seed-orders">
+        @for (order of seedOrders; track order.id) {
+          <option [value]="order.id">{{ order.label }}</option>
+        }
+      </datalist>
+      @if (showError('collectionOrderId', 'required')) {
+        <small class="field-error">La orden es obligatoria.</small>
+      }
+
+      <label for="merchantId">Comercio</label>
+      <input id="merchantId" formControlName="merchantId" maxlength="30" autocomplete="off" />
+      @if (showError('merchantId', 'required')) {
+        <small class="field-error">El comercio es obligatorio.</small>
+      }
+
+      <label for="amount">Monto (COP)</label>
+      <input id="amount" type="number" step="0.01" formControlName="amount" />
+      @if (showError('amount', 'required')) {
+        <small class="field-error">El monto es obligatorio.</small>
+      }
+
+      <button type="submit" [disabled]="submitting()">
+        {{ submitting() ? 'Procesando…' : 'Registrar pago' }}
+      </button>
+    </form>
+
+    @if (result(); as r) {
+      @switch (r.kind) {
+        @case ('applied') {
+          <div class="result applied" role="status">
+            <strong>Pago aplicado.</strong>
+            {{ formatCop(r.report.amount) }} sobre {{ r.report.collectionOrderId }} (referencia {{ r.report.paymentReference }}).
+          </div>
+        }
+        @case ('rejected') {
+          <div class="result rejected" role="status">
+            <strong>Pago rechazado:</strong> {{ reasonLabel(r.report.rejectionReason) }}.
+            El saldo de la orden no se modificó.
+          </div>
+        }
+        @case ('replayed') {
+          <div class="result replayed" role="status">
+            <strong>Referencia ya procesada.</strong> Se muestra el resultado original del procesamiento:
+            {{ r.report.status === 'APPLIED' ? 'aplicado' : 'rechazado (' + reasonLabel(r.report.rejectionReason) + ')' }},
+            {{ formatCop(r.report.amount) }} sobre {{ r.report.collectionOrderId }}. No se descontó saldo de nuevo.
+          </div>
+        }
+        @case ('conflict') {
+          <div class="result conflict" role="alert">
+            <strong>Conflicto:</strong> la referencia {{ r.paymentReference }} ya fue procesada con datos diferentes.
+            Se conserva el reporte original.
+          </div>
+        }
+        @case ('invalid') {
+          <div class="result failure" role="alert">
+            <strong>Solicitud inválida:</strong> {{ r.message }}
+            @if (r.errors.length) {
+              <ul>
+                @for (error of r.errors; track $index) {
+                  <li>{{ error.name }}: {{ error.message }}</li>
+                }
+              </ul>
+            }
+          </div>
+        }
+        @case ('error') {
+          <div class="result failure" role="alert"><strong>Error:</strong> {{ r.message }}</div>
+        }
+      }
+    }
+  </section>
+
+  <section>
+    <h2>Reportes recientes</h2>
+    @if (recentError(); as message) {
+      <p class="field-error">{{ message }}</p>
+    }
+    <div class="table-wrapper">
+      <table>
+        <thead>
+          <tr>
+            <th>Referencia</th>
+            <th>Orden</th>
+            <th class="number">Monto</th>
+            <th>Estado</th>
+            <th>Razón</th>
+            <th>Fecha</th>
+          </tr>
+        </thead>
+        <tbody>
+          @for (row of recentRows(); track row.reference) {
+            <tr>
+              <td>{{ row.reference }}</td>
+              <td>{{ row.order }}</td>
+              <td class="number">{{ row.amount }}</td>
+              <td [class.status-applied]="row.applied" [class.status-rejected]="!row.applied">{{ row.status }}</td>
+              <td>{{ row.reason }}</td>
+              <td>{{ row.processedAt }}</td>
+            </tr>
+          } @empty {
+            <tr>
+              <td colspan="6">Aún no hay reportes procesados.</td>
+            </tr>
+          }
+        </tbody>
+      </table>
+    </div>
+  </section>
+</main>
