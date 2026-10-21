@@ -1,3 +1,10 @@
 spring:
   application:
     name: banco-ias
+  r2dbc:
+    url: ${DB_URL:r2dbc:postgresql://localhost:5432/bancoias}
+    username: ${DB_USERNAME:bancoias}
+    password: ${DB_PASSWORD:bancoias}
+    pool:
+      initial-size: 5
+      max-size: 20
