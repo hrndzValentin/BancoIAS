@@ -8,6 +8,9 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 import com.ias.banco_ias.TestcontainersConfiguration;
+import com.ias.banco_ias.application.ProcessingOutcome.Conflict;
+import com.ias.banco_ias.application.ProcessingOutcome.Processed;
+import com.ias.banco_ias.application.ProcessingOutcome.Replayed;
 import com.ias.banco_ias.domain.PaymentCommand;
 import com.ias.banco_ias.domain.PaymentReport;
 import com.ias.banco_ias.domain.RejectionReason;
@@ -24,7 +27,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.core.io.ClassPathResource;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.r2dbc.connection.init.ResourceDatabasePopulator;
 import org.springframework.r2dbc.core.DatabaseClient;
 import org.springframework.test.context.ActiveProfiles;
@@ -36,6 +38,9 @@ class ProcessPaymentReportIntegrationTest {
 
 	@Autowired
 	private ProcessPaymentReportUseCase useCase;
+
+	@Autowired
+	private PaymentReportRepository repository;
 
 	@Autowired
 	private DatabaseClient databaseClient;
@@ -54,6 +59,13 @@ class ProcessPaymentReportIntegrationTest {
 
 	private static PaymentCommand command(String reference, String orderId, String merchantId, String amount) {
 		return new PaymentCommand(reference, orderId, merchantId, new BigDecimal(amount));
+	}
+
+	private Mono<PaymentReport> processNew(PaymentCommand command) {
+		return useCase.process(command).map(outcome -> {
+			assertThat(outcome).isInstanceOf(Processed.class);
+			return ((Processed) outcome).report();
+		});
 	}
 
 	private void assertBalance(String orderId, String expected) {
@@ -80,7 +92,7 @@ class ProcessPaymentReportIntegrationTest {
 
 	@Test
 	void appliesPaymentAndDecreasesBalance() {
-		StepVerifier.create(useCase.process(command("REF-1", "ORD-PSE-1001", "COM-10", "600000")))
+		StepVerifier.create(processNew(command("REF-1", "ORD-PSE-1001", "COM-10", "600000")))
 			.assertNext(report -> assertThat(report.status()).isEqualTo(ReportStatus.APPLIED))
 			.verifyComplete();
 
@@ -90,7 +102,7 @@ class ProcessPaymentReportIntegrationTest {
 
 	@Test
 	void appliesPaymentEqualToPendingBalance() {
-		StepVerifier.create(useCase.process(command("REF-1", "ORD-PSE-1001", "COM-10", "1000000")))
+		StepVerifier.create(processNew(command("REF-1", "ORD-PSE-1001", "COM-10", "1000000")))
 			.assertNext(report -> assertThat(report.status()).isEqualTo(ReportStatus.APPLIED))
 			.verifyComplete();
 
@@ -100,9 +112,9 @@ class ProcessPaymentReportIntegrationTest {
 	@Test
 	void appliesPartialPaymentsUntilBalanceIsExhausted() {
 		StepVerifier
-			.create(useCase.process(command("REF-1", "ORD-PSE-1001", "COM-10", "600000"))
-				.then(useCase.process(command("REF-2", "ORD-PSE-1001", "COM-10", "400000")))
-				.then(useCase.process(command("REF-3", "ORD-PSE-1001", "COM-10", "1"))))
+			.create(processNew(command("REF-1", "ORD-PSE-1001", "COM-10", "600000"))
+				.then(processNew(command("REF-2", "ORD-PSE-1001", "COM-10", "400000")))
+				.then(processNew(command("REF-3", "ORD-PSE-1001", "COM-10", "1"))))
 			.assertNext(report -> assertThat(report.rejectionReason()).isEqualTo(RejectionReason.INSUFFICIENT_BALANCE))
 			.verifyComplete();
 
@@ -115,11 +127,11 @@ class ProcessPaymentReportIntegrationTest {
 	@Test
 	void persistsEachRejectionWithoutTouchingBalances() {
 		Flux<PaymentReport> rejected = Flux.concat(
-				useCase.process(command("REF-AMOUNT", "ORD-PSE-1001", "COM-10", "0")),
-				useCase.process(command("REF-MISSING", "ORD-PSE-9999", "COM-10", "100000")),
-				useCase.process(command("REF-MERCHANT", "ORD-PSE-1001", "COM-20", "100000")),
-				useCase.process(command("REF-BLOCKED", "ORD-PSE-1002", "COM-10", "100000")),
-				useCase.process(command("REF-BALANCE", "ORD-PSE-2001", "COM-20", "2000000.01")));
+				processNew(command("REF-AMOUNT", "ORD-PSE-1001", "COM-10", "0")),
+				processNew(command("REF-MISSING", "ORD-PSE-9999", "COM-10", "100000")),
+				processNew(command("REF-MERCHANT", "ORD-PSE-1001", "COM-20", "100000")),
+				processNew(command("REF-BLOCKED", "ORD-PSE-1002", "COM-10", "100000")),
+				processNew(command("REF-BALANCE", "ORD-PSE-2001", "COM-20", "2000000.01")));
 		StepVerifier.create(rejected).expectNextCount(5).verifyComplete();
 
 		assertStoredReport("REF-AMOUNT", ReportStatus.REJECTED, RejectionReason.INVALID_AMOUNT);
@@ -136,7 +148,7 @@ class ProcessPaymentReportIntegrationTest {
 	void concurrentReportsNeverExceedPendingBalance() {
 		int reports = 10;
 		Flux<PaymentReport> concurrent = Flux.range(1, reports)
-			.flatMap(i -> useCase.process(command("REF-C-" + i, "ORD-PSE-1001", "COM-10", "300000")), reports);
+			.flatMap(i -> processNew(command("REF-C-" + i, "ORD-PSE-1001", "COM-10", "300000")), reports);
 
 		StepVerifier.create(concurrent.collectList()).assertNext(results -> {
 			Map<ReportStatus, List<PaymentReport>> byStatus =
@@ -151,18 +163,63 @@ class ProcessPaymentReportIntegrationTest {
 	}
 
 	@Test
-	void failedInsertRollsBackBalanceDecrease() {
-		StepVerifier.create(useCase.process(command("REF-DUP", "ORD-PSE-1001", "COM-10", "600000")))
-			.expectNextCount(1)
+	void repeatedReferenceWithSamePayloadReplaysOriginal() {
+		PaymentCommand command = command("REF-R", "ORD-PSE-1001", "COM-10", "600000");
+		PaymentReport original = processNew(command).block();
+
+		StepVerifier.create(useCase.process(command)).expectNext(new Replayed(original)).verifyComplete();
+
+		assertStoredReport("REF-R", ReportStatus.APPLIED, null);
+		assertBalance("ORD-PSE-1001", "400000");
+	}
+
+	@Test
+	void repeatedReferenceOfRejectedReportReplaysRejection() {
+		PaymentCommand command = command("REF-RJ", "ORD-PSE-1002", "COM-10", "100000");
+		PaymentReport original = processNew(command).block();
+
+		StepVerifier.create(useCase.process(command)).assertNext(outcome -> {
+			assertThat(outcome).isEqualTo(new Replayed(original));
+			assertThat(original.rejectionReason()).isEqualTo(RejectionReason.ORDER_NOT_ENABLED);
+		}).verifyComplete();
+
+		assertStoredReport("REF-RJ", ReportStatus.REJECTED, RejectionReason.ORDER_NOT_ENABLED);
+		assertBalance("ORD-PSE-1002", "800000");
+	}
+
+	@Test
+	void repeatedReferenceWithDifferentAmountIsConflictAndKeepsOriginal() {
+		PaymentReport original = processNew(command("REF-X", "ORD-PSE-1001", "COM-10", "600000")).block();
+
+		StepVerifier.create(useCase.process(command("REF-X", "ORD-PSE-1001", "COM-10", "500000")))
+			.expectNext(new Conflict(original))
 			.verifyComplete();
 
-		// Same reference: the UPDATE succeeds, then the INSERT violates UNIQUE(payment_reference).
-		StepVerifier.create(useCase.process(command("REF-DUP", "ORD-PSE-1001", "COM-10", "100000")))
-			.expectError(DataIntegrityViolationException.class)
-			.verify();
-
+		StepVerifier.create(repository.findByReference("REF-X")).expectNext(original).verifyComplete();
 		assertBalance("ORD-PSE-1001", "400000");
-		assertStoredReport("REF-DUP", ReportStatus.APPLIED, null);
+	}
+
+	@RepeatedTest(5)
+	void parallelRequestsWithSameReferenceApplyOnce() {
+		int requests = 5;
+		PaymentCommand command = command("REF-P", "ORD-PSE-1001", "COM-10", "300000");
+		Flux<ProcessingOutcome> parallel = Flux.range(1, requests).flatMap(i -> useCase.process(command), requests);
+
+		StepVerifier.create(parallel.collectList()).assertNext(outcomes -> {
+			assertThat(outcomes).filteredOn(Processed.class::isInstance).hasSize(1);
+			assertThat(outcomes).filteredOn(Replayed.class::isInstance).hasSize(requests - 1);
+			PaymentReport applied = outcomes.stream()
+				.filter(Processed.class::isInstance)
+				.map(outcome -> ((Processed) outcome).report())
+				.findFirst()
+				.orElseThrow();
+			assertThat(applied.status()).isEqualTo(ReportStatus.APPLIED);
+			assertThat(outcomes).filteredOn(Replayed.class::isInstance)
+				.allSatisfy(outcome -> assertThat(((Replayed) outcome).original()).isEqualTo(applied));
+		}).verifyComplete();
+
+		assertStoredReport("REF-P", ReportStatus.APPLIED, null);
+		assertBalance("ORD-PSE-1001", "700000");
 	}
 
 }

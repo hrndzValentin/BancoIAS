@@ -16,22 +16,23 @@ public record PaymentCommand(String paymentReference, String collectionOrderId, 
 	// ASCII unit separator: cannot appear in the business identifiers, so fields can't bleed into each other.
 	private static final String FIELD_SEPARATOR = "\u001F";
 
+	// Identifiers are normalized once here, so the hash, the domain rules and persistence all see the same values.
 	public PaymentCommand {
-		Objects.requireNonNull(paymentReference, "paymentReference");
-		Objects.requireNonNull(collectionOrderId, "collectionOrderId");
-		Objects.requireNonNull(merchantId, "merchantId");
+		paymentReference = Objects.requireNonNull(paymentReference, "paymentReference").trim();
+		collectionOrderId = Objects.requireNonNull(collectionOrderId, "collectionOrderId").trim();
+		merchantId = Objects.requireNonNull(merchantId, "merchantId").trim();
 		Objects.requireNonNull(amount, "amount");
 	}
 
 	/**
-	 * SHA-256 (hex) of the normalized business fields, used to tell whether a repeated
+	 * SHA-256 (hex) of the business fields, used to tell whether a repeated
 	 * paymentReference carries the same data as the original report (RF05).
 	 */
 	public String payloadHash() {
 		String canonical = String.join(FIELD_SEPARATOR,
-				paymentReference.strip(),
-				collectionOrderId.strip(),
-				merchantId.strip(),
+				paymentReference,
+				collectionOrderId,
+				merchantId,
 				amount.setScale(AMOUNT_SCALE, RoundingMode.HALF_UP).toPlainString());
 		try {
 			MessageDigest digest = MessageDigest.getInstance("SHA-256");

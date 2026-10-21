@@ -77,6 +77,19 @@ public class R2dbcPaymentReportRepository implements PaymentReportRepository {
 		return spec.map(R2dbcPaymentReportRepository::toPaymentReport).one();
 	}
 
+	@Override
+	public Mono<PaymentReport> findByReference(String paymentReference) {
+		return databaseClient.sql("""
+				SELECT payment_reference, collection_order_id, merchant_id, amount,
+				       status, rejection_reason, payload_hash, processed_at
+				  FROM payment_report
+				 WHERE payment_reference = :paymentReference
+				""")
+			.bind("paymentReference", paymentReference)
+			.map(R2dbcPaymentReportRepository::toPaymentReport)
+			.one();
+	}
+
 	private static PaymentReport toPaymentReport(Readable row) {
 		String rejectionReason = row.get("rejection_reason", String.class);
 		return new PaymentReport(row.get("payment_reference", String.class),

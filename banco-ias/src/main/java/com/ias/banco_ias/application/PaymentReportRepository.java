@@ -19,4 +19,7 @@ public interface PaymentReportRepository {
 
 	Mono<PaymentReport> insertReport(PaymentReport report);
 
+	/** Empty when no report has been processed with this reference. */
+	Mono<PaymentReport> findByReference(String paymentReference);
+
 }
