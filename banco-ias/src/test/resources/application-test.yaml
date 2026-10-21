@@ -1,0 +1,5 @@
+spring:
+  r2dbc:
+    pool:
+      # Enough connections for the RF04 concurrency test to run its 10 transactions in parallel.
+      max-size: 20
