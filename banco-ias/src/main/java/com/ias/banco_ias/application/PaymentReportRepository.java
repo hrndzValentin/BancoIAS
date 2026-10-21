@@ -4,6 +4,7 @@ import java.math.BigDecimal;
 
 import com.ias.banco_ias.domain.CollectionOrder;
 import com.ias.banco_ias.domain.PaymentReport;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 public interface PaymentReportRepository {
@@ -21,5 +22,8 @@ public interface PaymentReportRepository {
 
 	/** Empty when no report has been processed with this reference. */
 	Mono<PaymentReport> findByReference(String paymentReference);
+
+	/** Most recently processed reports first. */
+	Flux<PaymentReport> findRecent(int limit);
 
 }

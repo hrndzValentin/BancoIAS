@@ -91,6 +91,25 @@ class R2dbcPaymentReportRepositoryIntegrationTest {
 	}
 
 	@Test
+	void findRecentOrdersByProcessedAtThenIdAndAppliesLimit() {
+		Instant older = Instant.parse("2026-10-20T10:00:00Z");
+		Instant newer = Instant.parse("2026-10-20T11:00:00Z");
+		Mono<Void> inserts = repository.insertReport(reportAt("REF-OLD", older))
+			.then(repository.insertReport(reportAt("REF-NEW-1", newer)))
+			.then(repository.insertReport(reportAt("REF-NEW-2", newer)))
+			.then();
+
+		StepVerifier.create(inserts.thenMany(repository.findRecent(2)).map(PaymentReport::paymentReference))
+			.expectNext("REF-NEW-2", "REF-NEW-1")
+			.verifyComplete();
+	}
+
+	private static PaymentReport reportAt(String reference, Instant processedAt) {
+		return new PaymentReport(reference, "ORD-PSE-1001", "COM-10", new BigDecimal("1.00"), ReportStatus.APPLIED,
+				null, "a".repeat(64), processedAt);
+	}
+
+	@Test
 	void findByReferenceIsEmptyForUnknownReference() {
 		StepVerifier.create(repository.findByReference("REF-UNKNOWN")).verifyComplete();
 	}

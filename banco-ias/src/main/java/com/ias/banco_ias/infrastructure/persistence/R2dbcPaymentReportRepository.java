@@ -11,6 +11,7 @@ import com.ias.banco_ias.domain.PaymentReport;
 import com.ias.banco_ias.domain.RejectionReason;
 import com.ias.banco_ias.domain.ReportStatus;
 import io.r2dbc.spi.Readable;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import org.springframework.r2dbc.core.DatabaseClient;
@@ -88,6 +89,21 @@ public class R2dbcPaymentReportRepository implements PaymentReportRepository {
 			.bind("paymentReference", paymentReference)
 			.map(R2dbcPaymentReportRepository::toPaymentReport)
 			.one();
+	}
+
+	@Override
+	public Flux<PaymentReport> findRecent(int limit) {
+		// id breaks ties between reports processed in the same microsecond, keeping the order stable.
+		return databaseClient.sql("""
+				SELECT payment_reference, collection_order_id, merchant_id, amount,
+				       status, rejection_reason, payload_hash, processed_at
+				  FROM payment_report
+				 ORDER BY processed_at DESC, id DESC
+				 LIMIT :limit
+				""")
+			.bind("limit", limit)
+			.map(R2dbcPaymentReportRepository::toPaymentReport)
+			.all();
 	}
 
 	private static PaymentReport toPaymentReport(Readable row) {
