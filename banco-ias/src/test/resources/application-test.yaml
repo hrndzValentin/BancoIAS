@@ -3,3 +3,8 @@ spring:
     pool:
       # Enough connections for the RF04 concurrency test to run its 10 transactions in parallel.
       max-size: 20
+
+app:
+  events:
+    # Only the RabbitMQ tests turn publication on.
+    enabled: false

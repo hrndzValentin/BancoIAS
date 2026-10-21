@@ -11,18 +11,20 @@ banco-ias/                     backend (Java 21, Spring Boot 4.1.1 WebFlux, R2DB
   src/main/java/com/ias/banco_ias/
     domain/                    records, enums y PaymentRules (reglas RF02, sin Spring)
     application/               ProcessPaymentReportUseCase, PaymentReportQueryService,
-                               puerto PaymentReportRepository, ProcessingOutcome
+                               puertos PaymentReportRepository y PaymentEventPublisher, ProcessingOutcome
     infrastructure/
       persistence/             adaptador R2DBC (UPDATE condicional, INSERT … RETURNING)
       web/                     controller, DTOs, manejo de errores con ProblemDetail
-      config/                  Clock, TransactionalOperator
+      messaging/               publicador RabbitMQ del evento PaymentApplied (spring-amqp)
+      config/                  Clock, TransactionalOperator, propiedades app.events
   src/main/resources/          schema.sql, data.sql (semilla), application.yaml
 frontend/                      Angular 22.2.1 standalone, signals, sin librerías de UI
 docs/adr/                      decisiones técnicas
 ```
 Decisiones técnicas: [001 Concurrencia](docs/adr/001-concurrencia.md) ·
 [002 Idempotencia](docs/adr/002-idempotencia.md) · [003 Persistencia](docs/adr/003-persistencia.md) ·
-[004 Contrato HTTP](docs/adr/004-contrato-http.md) · [005 Arquitectura](docs/adr/005-arquitectura.md)
+[004 Contrato HTTP](docs/adr/004-contrato-http.md) · [005 Arquitectura](docs/adr/005-arquitectura.md) ·
+[006 Eventos RabbitMQ](docs/adr/006-eventos-rabbitmq.md)
 
 ## Requisitos previos
 | Herramienta | Versión usada |
@@ -30,9 +32,9 @@ Decisiones técnicas: [001 Concurrencia](docs/adr/001-concurrencia.md) ·
 | Java (JDK) | 21 (OpenJDK 21.0.12) |
 | Maven | incluido con el wrapper `./mvnw` |
 | Node.js / npm | 24.15.0 / 11.12.1 |
-| Docker / Docker Compose | 28.4.0 / v5.1.0 (Postgres y Testcontainers) |
+| Docker / Docker Compose | 28.4.0 / v5.1.0 (Postgres, RabbitMQ y Testcontainers) |
 
-**Puertos:** 5432 (PostgreSQL), 8080 (API), 4200 (UI).
+**Puertos:** 5432 (PostgreSQL), 5672 y 15672 (RabbitMQ y su management UI), 8080 (API), 4200 (UI).
 
 **Datos semilla** (`data.sql`; al iniciar no hay pagos aplicados):
 
@@ -44,7 +46,7 @@ Decisiones técnicas: [001 Concurrencia](docs/adr/001-concurrencia.md) ·
 
 ## Ejecución
 ```bash
-# 1. Base de datos (opcional: spring-boot-docker-compose la levanta sola al arrancar el backend)
+# 1. PostgreSQL y RabbitMQ (opcional: spring-boot-docker-compose los levanta al arrancar el backend)
 cd banco-ias && docker compose up -d
 
 # 2. Backend → http://localhost:8080
@@ -58,7 +60,7 @@ sobrescribe órdenes existentes.
 
 ### Pruebas
 ```bash
-cd banco-ias && ./mvnw test                 # 78 pruebas; requiere Docker (Testcontainers, postgres:16)
+cd banco-ias && ./mvnw test                 # 87 pruebas; requiere Docker (Testcontainers: postgres:16, rabbitmq:4.1.4)
 cd frontend && npx ng test --watch=false    # 12 pruebas (Vitest)
 ```
 
@@ -86,6 +88,25 @@ curl -i $API/NO-EXISTE
 curl -s $API/PSE-REF-001
 curl -s "$API?limit=5"
 ```
+
+## Eventos RabbitMQ (punto opcional)
+Cuando un pago queda **APPLIED**, después del commit se publica un evento `PaymentApplied` al exchange
+topic `payments.events` con la routing key `payment.applied`. Los rechazos, replays y conflictos no
+publican. La publicación es best-effort: si el broker no está o tarda más de 2 s, se registra un log de
+error y el pago sigue aplicado ([ADR-006](docs/adr/006-eventos-rabbitmq.md)).
+
+La app solo declara el exchange; las colas son de los consumidores. Para ver los mensajes, con
+`docker compose up -d` en marcha, crea una cola enlazada (o hazlo desde la UI en *Queues and Streams*):
+```bash
+M=http://localhost:15672/api; A="-u guest:guest -H content-type:application/json"
+curl $A -X PUT  $M/exchanges/%2F/payments.events -d '{"type":"topic","durable":true}'
+curl $A -X PUT  $M/queues/%2F/payments.applied.audit -d '{"durable":true}'
+curl $A -X POST $M/bindings/%2F/e/payments.events/q/payments.applied.audit -d '{"routing_key":"payment.applied"}'
+```
+Registra un pago aplicado (UI o curl) y abre http://localhost:15672 (guest / guest) → *Queues and
+Streams* → `payments.applied.audit` → *Get messages*. El evento es JSON persistente con `eventId`,
+`eventType`, `paymentReference`, `collectionOrderId`, `merchantId`, `amount` y `occurredAt`.
+Para desactivar la publicación: `app.events.enabled=false` (por ejemplo, `APP_EVENTS_ENABLED=false`).
 
 ## Recorrido desde la UI (http://localhost:4200)
 1. **RF01/RF03:** pulsa *Generar*, elige `ORD-PSE-1001`, monto `600000` y envía → resultado verde
@@ -121,11 +142,16 @@ inicial. Las pruebas de mutación están en [ADR-001](docs/adr/001-concurrencia.
 - **Razones de rechazo atadas a un CHECK:** el enum Java y el CHECK de `rejection_reason` deben cambiar
   juntos. Sin migraciones, una razón nueva haría fallar el `INSERT`.
 - **Sin migraciones:** `schema.sql` usa `IF NOT EXISTS`; un cambio de esquema exige `docker compose down -v`.
-- **RabbitMQ (opcional):** no implementado.
+- **Eventos at-most-once:** se publican después del commit y sin reintentos. Si la app cae entre el commit
+  y la publicación, o si el broker no está, el evento se pierde (queda un log de error). No hay consumidores
+  en este repo.
+- **Publicación bloqueante aislada:** spring-amqp corre en `boundedElastic`. Con el broker caído, un hilo
+  puede quedar ocupado hasta el `connection-timeout` (2 s).
 - **El frontend envía el monto como `number` de JavaScript:** pierde precisión por encima de 2⁵³.
 
 ## Mejoras propuestas
-- **Outbox transaccional** para publicar el evento "recaudo aplicado" a RabbitMQ sin perderlo ni duplicarlo.
+- **Outbox transaccional:** el evento se guarda en la misma transacción que el pago y un relay lo publica
+  con confirms → at-least-once, y los consumidores deduplican por `eventId`.
 - **Flyway** para versionar el esquema.
 - **Paginación por cursor** `(processed_at, id)` en los recientes; el índice ya existe.
 - **Autenticación y autorización** por comercio.
@@ -133,9 +159,9 @@ inicial. Las pruebas de mutación están en [ADR-001](docs/adr/001-concurrencia.
 ## Checklist de entregables
 - [x] Código fuente del backend (`banco-ias/`)
 - [x] Código fuente del frontend (`frontend/`)
-- [x] Pruebas automatizadas (78 backend + 12 frontend)
+- [x] Pruebas automatizadas (87 backend + 12 frontend)
 - [x] Instrucciones de ejecución (este README)
 - [x] Registro de decisiones técnicas (`docs/adr/`)
 - [ ] Registro de uso de IA (`AI_USAGE.md`, pendiente)
 - [x] Historial de commits
-- [ ] Punto opcional RabbitMQ (no implementado)
+- [x] Punto opcional RabbitMQ (evento `PaymentApplied`, [ADR-006](docs/adr/006-eventos-rabbitmq.md))

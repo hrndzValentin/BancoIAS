@@ -13,3 +13,24 @@ spring:
       mode: always
       schema-locations: classpath:schema.sql
       data-locations: classpath:data.sql
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+    publisher-confirm-type: correlated
+    # Fail fast when the broker is down instead of holding a boundedElastic thread for the 60s default.
+    connection-timeout: 2s
+
+management:
+  health:
+    rabbit:
+      # Events are best-effort: a broker outage must not mark the service DOWN.
+      enabled: false
+
+app:
+  events:
+    enabled: true
+    exchange: payments.events
+    routing-key: payment.applied
+    publish-timeout: 2s

@@ -1,6 +1,7 @@
 package com.ias.banco_ias.application;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Optional;
@@ -13,8 +14,12 @@ import com.ias.banco_ias.domain.PaymentReport;
 import com.ias.banco_ias.domain.PaymentRules;
 import com.ias.banco_ias.domain.RejectionReason;
 import com.ias.banco_ias.domain.ReportStatus;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Mono;
 
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.reactive.TransactionalOperator;
@@ -22,17 +27,35 @@ import org.springframework.transaction.reactive.TransactionalOperator;
 @Service
 public class ProcessPaymentReportUseCase {
 
+	private static final Logger log = LoggerFactory.getLogger(ProcessPaymentReportUseCase.class);
+
+	private static final Duration DEFAULT_PUBLISH_TIMEOUT = Duration.ofSeconds(2);
+
 	private final PaymentReportRepository repository;
 
 	private final TransactionalOperator transactionalOperator;
 
 	private final Clock clock;
 
+	private final PaymentEventPublisher eventPublisher;
+
+	private final Duration publishTimeout;
+
+	/** Without event publication. */
 	public ProcessPaymentReportUseCase(PaymentReportRepository repository, TransactionalOperator transactionalOperator,
 			Clock clock) {
+		this(repository, transactionalOperator, clock, new NoOpPaymentEventPublisher(), DEFAULT_PUBLISH_TIMEOUT);
+	}
+
+	@Autowired
+	public ProcessPaymentReportUseCase(PaymentReportRepository repository, TransactionalOperator transactionalOperator,
+			Clock clock, PaymentEventPublisher eventPublisher,
+			@Value("${app.events.publish-timeout:2s}") Duration publishTimeout) {
 		this.repository = repository;
 		this.transactionalOperator = transactionalOperator;
 		this.clock = clock;
+		this.eventPublisher = eventPublisher;
+		this.publishTimeout = publishTimeout;
 	}
 
 	public Mono<ProcessingOutcome> process(PaymentCommand command) {
@@ -43,6 +66,8 @@ public class ProcessPaymentReportUseCase {
 				.map(original -> compare(original, payloadHash))
 				.switchIfEmpty(Mono.defer(() -> processNew(command, payloadHash)
 					.<ProcessingOutcome>map(Processed::new)
+					// After the TransactionalOperator: only committed payments are published.
+					.flatMap(this::publishIfApplied)
 					// Outside the TransactionalOperator: by now the whole transaction, balance decrease
 					// included, has rolled back. A concurrent request with the same reference won the INSERT.
 					.onErrorResume(DuplicateKeyException.class, duplicate -> repository
@@ -50,6 +75,20 @@ public class ProcessPaymentReportUseCase {
 						.map(original -> compare(original, payloadHash))
 						.switchIfEmpty(Mono.error(duplicate)))));
 		});
+	}
+
+	// Best-effort (at-most-once): the payment is already committed, so a failed or slow publication is
+	// logged and never changes the outcome.
+	private Mono<ProcessingOutcome> publishIfApplied(ProcessingOutcome outcome) {
+		if (!(outcome instanceof Processed(PaymentReport report)) || report.status() != ReportStatus.APPLIED) {
+			return Mono.just(outcome);
+		}
+		return eventPublisher.publish(PaymentAppliedEvent.from(report))
+			.timeout(publishTimeout)
+			.doOnError(error -> log.error("PaymentApplied event for {} was not published; the payment stays applied",
+					report.paymentReference(), error))
+			.onErrorResume(error -> Mono.empty())
+			.thenReturn(outcome);
 	}
 
 	private static ProcessingOutcome compare(PaymentReport original, String payloadHash) {

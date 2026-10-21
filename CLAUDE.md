@@ -7,7 +7,9 @@ Requisitos: ver docs/REQUIREMENTS.md (fuente de verdad).
 - frontend/: Angular (standalone components)
 
 ## Arquitectura
-Hexagonal ligera: domain / application / infrastructure. Nada de JPA ni código bloqueante.
+Hexagonal ligera: domain / application / infrastructure. Nada de JPA ni código bloqueante, salvo la
+publicación a RabbitMQ con spring-amqp (RabbitTemplate), aislada en Schedulers.boundedElastic() y
+nunca en hilos de Netty (ver docs/adr/006-eventos-rabbitmq.md).
 
 ## Decisiones ya tomadas
 - RF04: UPDATE atómico condicional (pending_balance >= amount) en la misma transacción.

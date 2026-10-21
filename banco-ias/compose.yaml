@@ -15,5 +15,16 @@ services:
       timeout: 3s
       retries: 10
 
+  rabbitmq:
+    image: 'rabbitmq:4.1.4-management'
+    ports:
+      - '5672:5672'
+      - '15672:15672'
+    healthcheck:
+      test: ['CMD', 'rabbitmq-diagnostics', '-q', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
 volumes:
   postgres-data:
